@@ -7,7 +7,6 @@
 #include <string.h>
 
 #include <algorithm>
-#include <deque>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -27,9 +26,11 @@
 #include "ppapi/cpp/video_frame.h"
 #include "ppapi/utility/completion_callback_factory.h"
 
-// When compiling natively on Windows, PostMessage can be #define-d to
-// something else.
-#ifdef PostMessage
+// When compiling natively on Windows, PostMessage, min and max can be
+// #define-d to something else.
+#ifdef WIN32
+#undef min
+#undef max
 #undef PostMessage
 #endif
 
@@ -87,7 +88,7 @@ uint32_t IVFWriter::WriteFileHeader(uint8_t* mem,
   PutLE32(mem + 8, fourcc('V', 'P', '8', '0'));      // fourcc
   PutLE16(mem + 12, static_cast<uint16_t>(width));   // width
   PutLE16(mem + 14, static_cast<uint16_t>(height));  // height
-  PutLE32(mem + 16, 1000);                           // rate
+  PutLE32(mem + 16, 30);                             // rate
   PutLE32(mem + 20, 1);                              // scale
   PutLE32(mem + 24, 0xffffffff);                     // length
   PutLE32(mem + 28, 0);                              // unused
@@ -156,7 +157,6 @@ class VideoEncoderInstance : public pp::Instance {
   void Log(const std::string& message);
 
   void PostDataMessage(const void* buffer, uint32_t size);
-  void PostSignalMessage(const char* name);
 
   typedef std::map<std::string, PP_VideoProfile> VideoProfileFromStringMap;
   VideoProfileFromStringMap profile_from_string_;
@@ -179,8 +179,6 @@ class VideoEncoderInstance : public pp::Instance {
   pp::Size frame_size_;
   pp::Size encoder_size_;
   uint32_t encoded_frames_;
-
-  std::deque<uint64_t> frames_timestamps_;
 
   pp::VideoFrame current_track_frame_;
 
@@ -263,12 +261,6 @@ void VideoEncoderInstance::ConfigureTrack() {
                            frame_size_.height(),
                            PP_MEDIASTREAMVIDEOTRACK_ATTRIB_NONE};
 
-  pp::VarDictionary dict;
-  dict.Set(pp::Var("status"), pp::Var("configuring video track"));
-  dict.Set(pp::Var("width"), pp::Var(frame_size_.width()));
-  dict.Set(pp::Var("height"), pp::Var(frame_size_.height()));
-  PostMessage(dict);
-
   video_track_.Configure(
       attrib_list,
       callback_factory_.NewCallback(&VideoEncoderInstance::OnConfiguredTrack));
@@ -289,7 +281,6 @@ void VideoEncoderInstance::OnConfiguredTrack(int32_t result) {
 
 void VideoEncoderInstance::ProbeEncoder() {
   video_encoder_ = pp::VideoEncoder(this);
-  frames_timestamps_.clear();
   video_encoder_.GetSupportedProfiles(callback_factory_.NewCallbackWithOutput(
       &VideoEncoderInstance::OnEncoderProbed));
 }
@@ -308,8 +299,10 @@ void VideoEncoderInstance::OnEncoderProbed(
   }
 
   int32_t idx = 0;
-  for (const PP_VideoProfileDescription& profile : profiles)
+  for (uint32_t i = 0; i < profiles.size(); i++) {
+    const PP_VideoProfileDescription& profile = profiles[i];
     js_profiles.Set(idx++, pp::Var(VideoProfileToString(profile.profile)));
+  }
   PostMessage(dict);
 }
 
@@ -334,7 +327,7 @@ void VideoEncoderInstance::OnInitializedEncoder(int32_t result) {
   }
 
   is_encoding_ = true;
-  PostSignalMessage("started");
+  Log("started");
 
   if (video_encoder_.GetFrameCodedSize(&encoder_size_) != PP_OK) {
     LogError(result, "Cannot get encoder coded frame size");
@@ -432,8 +425,6 @@ int32_t VideoEncoderInstance::CopyVideoFrame(pp::VideoFrame dest,
 }
 
 void VideoEncoderInstance::EncodeFrame(const pp::VideoFrame& frame) {
-  frames_timestamps_.push_back(
-      static_cast<uint64_t>(frame.GetTimestamp() * 1000));
   video_encoder_.Encode(
       frame, PP_FALSE,
       callback_factory_.NewCallback(&VideoEncoderInstance::OnEncodeDone));
@@ -532,7 +523,7 @@ void VideoEncoderInstance::HandleMessage(const pp::Var& var_message) {
     ConfigureTrack();
   } else if (command == "stop") {
     StopEncode();
-    PostSignalMessage("stopped");
+    Log("stopped");
   } else {
     LogToConsole(PP_LOGLEVEL_ERROR, pp::Var("Invalid command!"));
   }
@@ -561,11 +552,10 @@ void VideoEncoderInstance::PostDataMessage(const void* buffer, uint32_t size) {
           size + ivf_writer_.GetFrameHeaderSize());
       data_ptr = static_cast<uint8_t*>(array_buffer.Map());
     }
-    uint64_t timestamp = frames_timestamps_.front();
-    frames_timestamps_.pop_front();
-    data_offset =
-        frame_offset +
-        ivf_writer_.WriteFrameHeader(data_ptr + frame_offset, timestamp, size);
+    data_offset = frame_offset +
+      ivf_writer_.WriteFrameHeader(data_ptr + frame_offset,
+                                   encoded_frames_,
+                                   size);
   } else {
     array_buffer = pp::VarArrayBuffer(size);
     data_ptr = static_cast<uint8_t*>(array_buffer.Map());
@@ -578,23 +568,21 @@ void VideoEncoderInstance::PostDataMessage(const void* buffer, uint32_t size) {
   PostMessage(dictionary);
 }
 
-void VideoEncoderInstance::PostSignalMessage(const char* name) {
-  pp::VarDictionary dictionary;
-  dictionary.Set(pp::Var("name"), pp::Var(name));
-
-  PostMessage(dictionary);
-}
-
 void VideoEncoderInstance::LogError(int32_t error, const std::string& message) {
   std::string msg("Error: ");
   msg.append(pp::Var(error).DebugString());
   msg.append(" : ");
   msg.append(message);
-  LogToConsole(PP_LOGLEVEL_ERROR, pp::Var(msg));
+
+  Log(msg);
 }
 
 void VideoEncoderInstance::Log(const std::string& message) {
-  LogToConsole(PP_LOGLEVEL_LOG, pp::Var(message));
+  pp::VarDictionary dictionary;
+  dictionary.Set(pp::Var("name"), pp::Var("log"));
+  dictionary.Set(pp::Var("message"), pp::Var(message));
+
+  PostMessage(dictionary);
 }
 
 pp::Instance* VideoEncoderModule::CreateInstance(PP_Instance instance) {
